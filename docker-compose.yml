@@ -1,0 +1,14 @@
+version: '3'
+
+services:
+
+  janus-dev:
+    image: janus-dev:v1.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: janus-dev
+    network_mode: host
+    command: ["sleep", "infinity"]
+    volumes:
+      - .:/root/janus-gateway

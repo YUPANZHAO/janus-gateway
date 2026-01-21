@@ -2004,6 +2004,7 @@ var Janus = (function (factory) {
 				};
 				event.track.onmute = function(ev) {
 					Janus.log('Remote track muted:', ev);
+					return;
 					if(!trackMutedTimeoutId) {
 						trackMutedTimeoutId = setTimeout(function() {
 							Janus.log('Removing remote track');
@@ -2027,6 +2028,7 @@ var Janus = (function (factory) {
 				};
 				event.track.onunmute = function(ev) {
 					Janus.log('Remote track flowing again:', ev);
+					return;
 					if(trackMutedTimeoutId != null) {
 						clearTimeout(trackMutedTimeoutId);
 						trackMutedTimeoutId = null;

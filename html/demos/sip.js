@@ -19,6 +19,166 @@ var masterId = null, helpers = {}, helpersCount = 0;
 
 var incoming = null;
 
+function itcCustomizeSdp(offer) {
+    console.debug("zyp debug - customsize sdp:", offer.sdp)
+
+    const lines = offer.sdp.split('\n');
+
+	const m_line_regex = /^m=(\w+) (.+) (.+)/;
+    const rtpmap_regex = /^a=rtpmap:(\d+) (.+)/;
+    const fmtp_regex = /^a=fmtp:(\d+) (.+)/;
+    const rtcp_fb_regex = /^a=rtcp-fb:(\d+) (.+)/;
+    
+    let match;
+    let new_sdp = "";
+
+    let m_type = "";
+    let has_found_codec = false;
+    let m_desc_before = "";
+    let m_desc_after = "";
+    let codec_set = new Map();
+
+	let codec_select = () => {
+        let codecs = [...codec_set.values()];
+        console.debug("type: ", m_type, "origin codecs:", codecs);
+
+		let codec_list = [];
+        	
+		if(m_type == "audio") {
+            let opus = codecs.find(codec => codec.codec_name == 'opus/48000/2');
+            let pcmu = codecs.find(codec => codec.codec_name == 'PCMU/8000');
+            let pcma = codecs.find(codec => codec.codec_name == 'PCMA/8000');
+            let g722 = codecs.find(codec => codec.codec_name == 'G722/8000');
+            let telephone_event = codecs.find(codec => codec.codec_name == 'telephone-event/8000');
+
+            if(opus) {
+                let opus_48k = { ...opus }; opus_48k.pt = 124; opus_48k.fmtp = 'maxaveragebitrate=48000';
+                let opus_24k = { ...opus }; opus_24k.pt = 123; opus_24k.fmtp = 'maxaveragebitrate=24000';
+                let opus_16k = { ...opus }; opus_16k.pt = 122; opus_16k.fmtp = 'maxaveragebitrate=16000';
+                codec_list.push(opus_48k);
+                codec_list.push(opus_24k);
+                codec_list.push(opus_16k);
+            }
+            if(pcma) {
+                pcma.pt = 8;
+                codec_list.push(pcma);
+            }
+            if(pcmu) {
+                pcmu.pt = 0;
+                codec_list.push(pcmu);
+            }
+            if(g722) {
+                g722.pt = 9;
+                codec_list.push(g722);
+            }
+            if(telephone_event) {
+                telephone_event.pt = 101;
+                codec_list.push(telephone_event);
+            }
+        }else if(m_type == "video") {
+            let h264_baseline = codecs.find(codec => codec.codec_name == 'H264/90000' && codec.fmtp.includes(`profile-level-id=42`));
+            let h264_high_profile = codecs.find(codec => codec.codec_name == 'H264/90000' && codec.fmtp.includes(`profile-level-id=64`));
+            let h265 = codecs.find(codec => codec.codec_name == 'H265/90000');
+            
+            // if(h265) {
+            //     h265.pt = 113;
+            //     codec_list.push(h265);
+            // }
+            if(h264_high_profile) {
+                h264_high_profile.pt = 112;
+                codec_list.push(h264_high_profile);
+            }
+            if(h264_baseline) {
+                h264_baseline.pt = 110;
+                codec_list.push(h264_baseline);
+            }
+        }
+        
+        console.debug("select codecs:", codec_list);
+        return codec_list;
+    }
+    
+	let process_other_line = (line) => {
+    	new_sdp += line + '\n';
+    }
+
+	let process_m_and_a_line = (line) => {
+        if((match = rtpmap_regex.exec(line)) !== null) {
+            if(!codec_set.has(match[1])) {
+                codec_set.set(match[1], {
+                    pt: match[1],
+                    codec_name: "",
+                    fmtp: "",
+                    rtcp_fb_list: []
+                });
+                has_found_codec = true;
+            }
+         	codec_set.get(match[1]).codec_name = match[2];
+        }else if((match = fmtp_regex.exec(line)) !== null) {
+            codec_set.get(match[1]).fmtp = match[2];
+        }else if((match = rtcp_fb_regex.exec(line)) !== null) {
+            codec_set.get(match[1]).rtcp_fb_list.push(match[2]);
+        }else {
+            if(has_found_codec)
+           		m_desc_after += line + '\n';
+            else 
+           		m_desc_before += line + '\n';
+        }
+    }
+
+    let handle_m_block = () => {
+		if(m_type == "") return;
+
+        let m_line_codec_desc = "";
+        
+        let m_desc = m_desc_before;
+		let codec_list = codec_select();
+        for(const codec of codec_list) {
+            m_line_codec_desc += ` ${codec.pt}`;
+            m_desc += `a=rtpmap:${codec.pt} ${codec.codec_name}\n`;
+            for(const rtcp_fb of codec.rtcp_fb_list) {
+                m_desc += `a=rtcp-fb:${codec.pt} ${rtcp_fb}\n`;
+            }
+        	if(codec.fmtp.length > 0)
+            	m_desc += `a=fmtp:${codec.pt} ${codec.fmtp}\n`;
+			// if(codec.codec_name == "H264/90000") {
+			// 	if(codec.pt == 112) {
+			// 		m_line_codec_desc += " 115";
+			// 		m_desc += "a=rtpmap:115 rtx/90000\na=fmtp:115 apt=112\n";
+			// 	}else if(codec.pt == 110) {
+			// 		m_line_codec_desc += " 116";
+			// 		m_desc += "a=rtpmap:116 rtx/90000\na=fmtp:116 apt=110\n";
+			// 	}
+			// }
+        }
+        
+        m_desc += m_desc_after;
+     	m_desc = m_desc.replace(/(^m=\S+\s+\S+\s+\S+)(.+)/gm, `$1${m_line_codec_desc}`);
+        new_sdp += m_desc;
+    }
+
+	let process = process_other_line;
+    for(const [_, line] of lines.entries()) {
+        if(line.length == 0) continue;
+        if((match = m_line_regex.exec(line)) !== null) {
+            handle_m_block();
+
+            m_type = match[1];
+            has_found_codec = false;
+            m_desc_before = "";
+            m_desc_after = "";
+        	codec_set.clear();
+
+            process = process_m_and_a_line;
+        }
+        process(line);
+    }
+    handle_m_block();
+
+    console.debug(new_sdp);
+
+    offer.sdp = new_sdp;
+}
 
 $(document).ready(function() {
 	// Initialize the library (all console debuggers enabled)
@@ -358,9 +518,14 @@ $(document).ready(function() {
 											// We got an INFO
 											let sender = result["displayname"] ? result["displayname"] : result["sender"];
 											let content = result["content"];
-											content = content.replace(new RegExp('<', 'g'), '&lt');
-											content = content.replace(new RegExp('>', 'g'), '&gt');
-											toastr.info(content, "Info from " + sender);
+											let type = result["type"];
+											if(type == "application/media_control+xml") {
+												sipcall.send({message: {request: "keyframe", user: true, peer: true}});
+											}else {
+												content = content.replace(new RegExp('<', 'g'), '&lt');
+												content = content.replace(new RegExp('>', 'g'), '&gt');
+												toastr.info(content, "Info from " + sender);
+											}
 										} else if(event === 'notify') {
 											// We got a NOTIFY
 											let notify = result["notify"];
@@ -562,10 +727,20 @@ $(document).ready(function() {
 										}
 										$('#dtmf .dtmf').click(function() {
 											// Send DTMF tone (inband)
-											sipcall.dtmf({dtmf: { tones: $(this).text()}});
+											// sipcall.dtmf({dtmf: { tones: $(this).text()}});
 											// Notice you can also send DTMF tones using SIP INFO
-											// 		sipcall.send({message: {request: "dtmf_info", digit: $(this).text()}});
+											sipcall.send({message: {request: "dtmf_info", digit: $(this).text()}});
+
+											if($(this).text() == "#") {
+												if(sipcall && sipcall.callId != null)
+													sipcall.send({message: {request: "keyframe", user: true, peer: true}});
+											}
 										});
+										sipcall.send({message: {request: "keyframe", user: true, peer: true}});
+										setTimeout(function () {
+											if(sipcall && sipcall.callId != null)
+												sipcall.send({message: {request: "keyframe", user: true, peer: true}});
+										}, 2000);
 										$('#msg').click(function() {
 											bootbox.prompt("Insert message to send", function(result) {
 												if(result && result !== '') {
@@ -964,7 +1139,8 @@ function actuallyDoCall(handle, uri, doVideo, referId) {
 			error: function(error) {
 				Janus.error("WebRTC error...", error);
 				bootbox.alert("WebRTC error... " + error.message);
-			}
+			},
+			customizeSdp: itcCustomizeSdp // add by zyp
 		});
 }
 

@@ -4920,7 +4920,7 @@ static gboolean janus_ice_outgoing_traffic_handle(janus_ice_handle *handle, janu
 				}
 				/* Encrypt SRTP */
 				int protected = pkt->length;
-				int res = janus_is_webrtc_encryption_enabled() ?
+				int res = janus_is_webrtc_encryption_enabled() && (*(pkt->data) != 0) ?
 					srtp_protect(pc->dtls->srtp_out, pkt->data, &protected) : srtp_err_status_ok;
 				if(res != srtp_err_status_ok) {
 					/* We don't spam the logs for every SRTP error: just take note of this, and print a summary later */

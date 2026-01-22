@@ -126,6 +126,8 @@ function itcCustomizeSdp(offer) {
         }
     }
 
+	let m_video_idx = 0;
+
     let handle_m_block = () => {
 		if(m_type == "") return;
 
@@ -151,7 +153,16 @@ function itcCustomizeSdp(offer) {
 			// 	}
 			// }
         }
-        
+
+		if(m_type == "video") {
+			if(m_video_idx == 0) {
+				m_desc += "a=content:main\n";
+				m_video_idx = 1;
+			}else {
+				m_desc += "a=content:slides\n";
+			}
+		}
+
         m_desc += m_desc_after;
      	m_desc = m_desc.replace(/(^m=\S+\s+\S+\s+\S+)(.+)/gm, `$1${m_line_codec_desc}`);
         new_sdp += m_desc;
@@ -1095,8 +1106,10 @@ function actuallyDoCall(handle, uri, doVideo, referId) {
 	handle.doAudio = true;
 	handle.doVideo = doVideo;
 	let tracks = [{ type: 'audio', capture: true, recv: true }];
-	if(doVideo)
+	if(doVideo) {
 		tracks.push({ type: 'video', capture: true, recv: true });
+		tracks.push({ type: 'extvideo', capture: true, recv: true });
+	}
 	handle.createOffer(
 		{
 			tracks: tracks,

@@ -743,6 +743,7 @@
 #include "../utils.h"
 #include "../ip-utils.h"
 
+#include "bfcp/bfcp_messages.h"
 
 /* Plugin information */
 #define JANUS_SIP_VERSION			9
@@ -1026,6 +1027,21 @@ typedef struct ssip_oper_s ssip_oper_t;
 #undef NUA_HMAGIC_T
 #define NUA_HMAGIC_T	ssip_oper_t
 
+typedef struct janus_sip_bfcp {
+	/* mutex */
+	janus_mutex mutex;
+	/* socket */
+	int fd;
+	/* bfcp client info */
+	uint32_t conf_id;
+	uint16_t trans_id;
+	uint16_t user_id;
+	uint16_t floor_id;
+	/* bfcp context */
+	bfcp_entity *ctx;
+	bfcp_arguments *arg;
+} janus_sip_bfcp;
+
 struct ssip_s {
 	su_home_t s_home[1];
 	su_root_t *s_root;
@@ -1113,6 +1129,7 @@ typedef struct janus_sip_media {
 	int video_orientation_extension_id;
 	int audio_level_extension_id;
 	int dtmf_pt;
+	janus_sip_bfcp bfcp;
 } janus_sip_media;
 
 typedef struct janus_sip_dtmf {
@@ -1305,6 +1322,7 @@ static void janus_sip_session_free(const janus_refcount *session_ref) {
 	g_hash_table_destroy(session->media_byfd);
 	janus_mutex_destroy(&session->mutex);
 	janus_mutex_destroy(&session->rec_mutex);
+	janus_mutex_destroy(&session->media.bfcp.mutex);
 	g_free(session);
 }
 
@@ -1583,6 +1601,21 @@ static int janus_sip_allocate_local_ports(janus_sip_session *session, janus_sdp 
 static void *janus_sip_relay_thread(void *data);
 static void janus_sip_media_cleanup(janus_sip_session *session);
 static void janus_sip_check_rfc2833(janus_sip_session *session, char *buffer, int len);
+
+static void janus_sip_sdp_add_bfcp(janus_sdp *sdp);
+
+static void janus_sip_bfcp_init(janus_sip_bfcp *bfcp);
+static void janus_sip_bfcp_cleanup(janus_sip_bfcp *bfcp);
+static void janus_sip_handle_bfcp_msg(janus_sip_session *session, char *buffer, int len);
+static void janus_sip_bfcp_send_message(janus_sip_session *session, bfcp_message *msg);
+static void janus_sip_bfcp_send_hello(janus_sip_session *session);
+static void janus_sip_bfcp_send_hello_ack(janus_sip_session *session, bfcp_received_message* recv_msg);
+static void janus_sip_bfcp_send_floor_request(janus_sip_session *session);
+static void janus_sip_bfcp_send_floor_release(janus_sip_session *session);
+static void janus_sip_bfcp_send_floor_request_status(janus_sip_session* session, bfcp_received_message* recv_msg);
+static void janus_sip_bfcp_send_floor_status_ack(janus_sip_session* session, bfcp_received_message* recv_msg);
+static void janus_sip_bfcp_send_floor_request_status_ack(janus_sip_session* session, bfcp_received_message* recv_msg);
+static void janus_sip_report_bfcp_status(janus_sip_session* session, const char* status);
 
 /* URI parsing utilities */
 
@@ -2324,6 +2357,9 @@ void janus_sip_create_session(janus_plugin_session *handle, int *error) {
 	session->media.pipefd[1] = -1;
 	session->media.updated = FALSE;
 	session->media_byfd = g_hash_table_new(NULL, NULL);
+	/* Init BFCP CTX */
+	janus_sip_bfcp_init(&session->media.bfcp);
+	janus_mutex_init(&session->media.bfcp.mutex);
 	janus_mutex_init(&session->rec_mutex);
 	g_atomic_int_set(&session->establishing, 0);
 	g_atomic_int_set(&session->established, 0);
@@ -3692,6 +3728,7 @@ static void *janus_sip_handler(void *data) {
 					session->media.has_video = TRUE;
 				temp = temp->next;
 			}
+			janus_sip_sdp_add_bfcp(parsed_sdp);
 			janus_mutex_lock(&session->mutex);
 			if(janus_sip_allocate_local_ports(session, parsed_sdp, FALSE) < 0) {
 				janus_mutex_unlock(&session->mutex);
@@ -5062,6 +5099,21 @@ static void *janus_sip_handler(void *data) {
 			/* Notify the result */
 			result = json_object();
 			json_object_set_new(result, "event", json_string("reset"));
+		} else if(!strcasecmp(request_text, "send_bfcp")) {
+			json_t *primitive = json_object_get(root, "primitive");
+			const char *primitive_text = json_string_value(primitive);
+
+			if(!strcasecmp(primitive_text, "Hello")) {
+				janus_sip_bfcp_send_hello(session);
+			} else if(!strcasecmp(primitive_text, "FloorRequest")) {
+				janus_sip_bfcp_send_floor_request(session);
+			} else if(!strcasecmp(primitive_text, "FloorRelease")) {
+				janus_sip_bfcp_send_floor_release(session);
+			}
+			
+			/* Notify the result */
+			result = json_object();
+			json_object_set_new(result, "event", json_string("bfcpsent"));
 		} else {
 			JANUS_LOG(LOG_ERR, "Unknown request (%s)\n", request_text);
 			error_code = JANUS_SIP_ERROR_INVALID_REQUEST;
@@ -6129,7 +6181,9 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			/* Send event back to the application */
 			json_t *jsep = NULL;
 			if(!session->media.earlymedia) {
-				jsep = json_pack("{ssss}", "type", "answer", "sdp", fixed_sdp);
+				char* sdp_str = janus_sdp_write(sdp);
+				jsep = json_pack("{ssss}", "type", "answer", "sdp", sdp_str);
+				g_free(sdp_str);
 			} else {
 				/* We've received the 200 OK after the 183, we can remove the flag now */
 				session->media.earlymedia = FALSE;
@@ -6505,7 +6559,7 @@ void janus_sip_sdp_process(janus_sip_session *session, janus_sdp *sdp, gboolean 
 		session->media.require_srtp = session->media.require_srtp || (m->proto && !strcasecmp(m->proto, "RTP/SAVP"));
 		if(session->media.require_srtp && !answer)
 			session->media.offer_srtp = TRUE;
-		if(m->type == JANUS_SDP_AUDIO || m->type == JANUS_SDP_VIDEO) {
+		if(m->type == JANUS_SDP_AUDIO || m->type == JANUS_SDP_VIDEO || !strcasecmp(m->proto, "UDP/BFCP")) {
 			session->media.mlines[m->index].index = m->index;
 			session->media.mlines[m->index].type = m->type;
 			if(m->port) {
@@ -6618,6 +6672,15 @@ void janus_sip_sdp_process(janus_sip_session *session, janus_sdp *sdp, gboolean 
 				}
 			}
 		}
+
+		if(answer && m->type == JANUS_SDP_APPLICATION && !strcasecmp(m->proto, "UDP/BFCP")) {
+			GList *next = temp->next;
+			sdp->m_lines = g_list_remove(sdp->m_lines, m);
+			janus_sdp_mline_destroy(m);
+			temp = next;
+			continue;
+		}
+
 		temp = temp->next;
 	}
 	if(update && changed && *changed) {
@@ -6646,8 +6709,10 @@ char *janus_sip_sdp_manipulate(janus_sip_session *session, janus_sdp *sdp, gbool
 	GList *temp = sdp->m_lines;
 	while(temp) {
 		janus_sdp_mline *m = (janus_sdp_mline *)temp->data;
-		g_free(m->proto);
-		m->proto = g_strdup(session->media.require_srtp ? "RTP/SAVP" : "RTP/AVP");
+		if(strcasecmp(m->proto, "UDP/BFCP")) {
+			g_free(m->proto);
+			m->proto = g_strdup(session->media.require_srtp ? "RTP/SAVP" : "RTP/AVP");
+		}
 		if(session->media.num_mlines <= m->index) {
 			session->media.num_mlines = m->index + 1;
 			session->media.mlines[m->index].rtp_fd = -1;
@@ -6655,7 +6720,7 @@ char *janus_sip_sdp_manipulate(janus_sip_session *session, janus_sdp *sdp, gbool
 			session->media.mlines[m->index].has_srtp_local = session->media.require_srtp ||
 				session->media.offer_srtp || session->media.mlines[m->index].has_srtp_remote;
 		}
-		if(m->type == JANUS_SDP_AUDIO || m->type == JANUS_SDP_VIDEO) {
+		if(m->type == JANUS_SDP_AUDIO || m->type == JANUS_SDP_VIDEO || m->type == JANUS_SDP_APPLICATION) {
 			m->port = session->media.mlines[m->index].local_rtp_port;
 			if(session->media.mlines[m->index].has_srtp_local) {
 				if(!session->media.mlines[m->index].srtp_local_profile || !session->media.mlines[m->index].srtp_local_crypto) {
@@ -6770,7 +6835,7 @@ static int janus_sip_allocate_local_ports(janus_sip_session *session, janus_sdp 
 			session->media.mlines[m->index].has_srtp_local = session->media.require_srtp ||
 				session->media.offer_srtp || session->media.mlines[m->index].has_srtp_remote;
 		}
-		if(m->port == 0 || (m->type != JANUS_SDP_AUDIO && m->type != JANUS_SDP_VIDEO)) {
+		if(strcasecmp(m->proto, "UDP/BFCP") && (m->port == 0 || (m->type != JANUS_SDP_AUDIO && m->type != JANUS_SDP_VIDEO))) {
 			session->media.mlines[m->index].active = FALSE;
 			temp = temp->next;
 			continue;
@@ -6794,6 +6859,9 @@ static int janus_sip_allocate_local_ports(janus_sip_session *session, janus_sdp 
 					JANUS_LOG(LOG_WARN, "Error setting v6only to false on %s RTP socket (error=%s)\n",
 						janus_sdp_mtype_str(m->type), g_strerror(errno));
 				}
+				/* Set bfcp fd */
+				if(!strcasecmp(m->proto, "UDP/BFCP"))
+					session->media.bfcp.fd = session->media.mlines[m->index].rtp_fd;
 				/* Set the DSCP value if set in the config file */
 				int dscp_rtp = 0;
 				if(session->media.mlines[m->index].type == JANUS_SDP_AUDIO)
@@ -6969,6 +7037,9 @@ static void janus_sip_media_cleanup(janus_sip_session *session) {
 
 	/* Media fields not cleaned up elsewhere */
 	janus_sip_media_reset(session);
+
+	/* Clean up BFCP CTX */
+	janus_sip_bfcp_cleanup(&session->media.bfcp);
 }
 
 /* Thread to relay RTP/RTCP frames coming from the SIP peer */
@@ -7148,6 +7219,13 @@ static void *janus_sip_relay_thread(void *data) {
 					/* Failed to read? */
 					continue;
 				}
+				
+				/* Check bfcp */
+				if(fds[i].fd == session->media.bfcp.fd) {
+					janus_sip_handle_bfcp_msg(session, buffer, bytes);
+					continue;
+				}
+
 				/* Let's check what this is */
 				janus_mutex_lock(&session->mutex);
 				janus_sip_media_line *mline = g_hash_table_lookup(session->media_byfd, GINT_TO_POINTER(fds[i].fd));
@@ -7400,6 +7478,303 @@ static void janus_sip_check_rfc2833(janus_sip_session *session, char *buffer, in
 	JANUS_LOG(LOG_VERB, "  >> Pushing event to peer: %d (%s)\n", ret, janus_get_api_error(ret));
 	json_decref(info);
 	return;
+}
+
+static void janus_sip_sdp_add_bfcp(janus_sdp *sdp) {
+	/* Check video slides exist or not */
+	gboolean hav_video_slides = FALSE;
+	GList *temp = sdp->m_lines;
+	while(temp && !hav_video_slides) {
+		janus_sdp_mline *m = (janus_sdp_mline *)temp->data;
+		if(m->type == JANUS_SDP_VIDEO) {
+			GList *tempA = m->attributes;
+			while(tempA) {
+				janus_sdp_attribute *a = (janus_sdp_attribute *)tempA->data;
+				if(!strcasecmp(a->name, "content") && strstr(a->value, "slides") == NULL) {
+					hav_video_slides = TRUE;
+					break;
+				}
+				tempA = tempA->next;
+			}
+		}
+		temp = temp->next;
+	}
+
+	if(hav_video_slides) {
+		/* insert bfcp application */
+		janus_sdp_mline *bfcp_m = janus_sdp_mline_create(JANUS_SDP_APPLICATION, 0, "UDP/BFCP", JANUS_SDP_SENDRECV);
+		bfcp_m->index = g_list_length(sdp->m_lines);
+		bfcp_m->c_ipv4 = TRUE;
+		bfcp_m->c_addr = g_strdup(sdp->c_addr);
+		bfcp_m->fmts = g_list_append(bfcp_m->fmts, g_strdup("*"));
+
+		janus_sdp_attribute *a = NULL;
+		a = janus_sdp_attribute_create("floorctrl", "c-only");
+		bfcp_m->attributes = g_list_append(bfcp_m->attributes, a);
+		
+		sdp->m_lines = g_list_append(sdp->m_lines, bfcp_m);
+	}
+}
+
+static void janus_sip_bfcp_init(janus_sip_bfcp *bfcp) {
+	bfcp->fd = -1;
+	
+	bfcp->conf_id = janus_random_uint32() % 1000;
+	bfcp->floor_id = janus_random_uint32() % 1000;
+	bfcp->trans_id = 1;
+	bfcp->user_id = janus_random_uint32() % 1000;
+	
+	bfcp->ctx = bfcp_new_entity(bfcp->conf_id, bfcp->trans_id, bfcp->user_id);
+	bfcp->arg = bfcp_new_arguments();
+	bfcp->arg->entity = bfcp->ctx;
+}
+
+static void janus_sip_bfcp_cleanup(janus_sip_bfcp *bfcp) {
+	bfcp->fd = -1;
+	if(bfcp->arg) {
+		bfcp_free_arguments(bfcp->arg);
+		bfcp->arg = NULL;
+	}
+}
+
+static void janus_sip_handle_bfcp_msg(janus_sip_session *session, char *buffer, int len) {
+	bfcp_message* msg = bfcp_new_message((unsigned char*)buffer, len);
+	if(!msg) {
+		JANUS_LOG(LOG_ERR, "bfcp new message failed...\n");
+		return;
+	}
+
+	bfcp_received_message* recv_msg = bfcp_parse_message(msg);
+	if(!recv_msg) {
+		bfcp_free_message(msg);
+		JANUS_LOG(LOG_ERR, "bfcp parse message failed...\n");
+		return;
+	}
+
+	JANUS_LOG(LOG_DBG, "bfcp recv message: %d\n", recv_msg->primitive);
+	switch(recv_msg->primitive) {
+	case e_primitive_FloorRequest:
+		janus_sip_bfcp_send_floor_request_status(session, recv_msg);
+		janus_sip_report_bfcp_status(session, "SERVER OPEN");
+		break;
+	case e_primitive_FloorRelease:
+		janus_sip_bfcp_send_floor_request_status(session, recv_msg);
+		janus_sip_report_bfcp_status(session, "SERVER CLOSE");
+		break;
+	case e_primitive_FloorRequestStatus:
+		janus_sip_bfcp_send_floor_request_status_ack(session, recv_msg);
+		janus_sip_report_bfcp_status(session, recv_msg->arguments->frqInfo->oRS->rs->rs == BFCP_GRANTED ? "CLIENT OPEN" : "CLIENT CLOSE");
+		break;
+	case e_primitive_FloorStatus:
+		janus_sip_bfcp_send_floor_status_ack(session, recv_msg);
+		janus_sip_report_bfcp_status(session, recv_msg->arguments->frqInfo->oRS->rs->rs == BFCP_GRANTED ? "SERVER OPEN" : "SERVER CLOSE");
+		break;
+	case e_primitive_Hello:
+		janus_sip_bfcp_send_hello_ack(session, recv_msg);
+		break;
+	case e_primitive_HelloAck:
+	case e_primitive_FloorRequestStatusAck:
+	case e_primitive_FloorStatusAck:
+		break;
+	default:
+		break;
+	};
+
+	bfcp_free_received_message(recv_msg);
+	bfcp_free_message(msg);
+}
+
+static void janus_sip_bfcp_send_message(janus_sip_session *session, bfcp_message *msg) {
+	if(session->media.bfcp.fd <= -1) return;
+	if(send(session->media.bfcp.fd, msg->buffer, msg->length, 0) < 0) {
+		JANUS_LOG(LOG_HUGE, "[SIP-%s] Error sending BFCP packet... %s (len=%d)...\n",
+			session->account.username, g_strerror(errno), msg->length);
+	}
+}
+
+static void janus_sip_bfcp_send_hello(janus_sip_session *session) {
+	janus_sip_bfcp *bfcp = &session->media.bfcp;
+	if(bfcp->arg == NULL) return;
+
+	janus_mutex_lock(&bfcp->mutex);
+	bfcp->arg->primitive = e_primitive_Hello;
+	bfcp->arg->entity->transactionID = bfcp->trans_id++;
+	bfcp->arg->fID = bfcp_new_floor_id_list(bfcp->floor_id, 0);
+
+	bfcp_message *msg = bfcp_build_message(bfcp->arg);
+	janus_sip_bfcp_send_message(session, msg);
+
+    bfcp_free_message(msg);
+	bfcp_free_floor_id_list(bfcp->arg->fID);
+	bfcp->arg->fID = NULL;
+	janus_mutex_unlock(&bfcp->mutex);
+}
+
+static void janus_sip_bfcp_send_hello_ack(janus_sip_session *session, bfcp_received_message* recv_msg) {
+	janus_sip_bfcp *bfcp = &session->media.bfcp;
+	if(bfcp->arg == NULL) return;
+
+	janus_mutex_lock(&bfcp->mutex);
+	bfcp->arg->primitive = e_primitive_HelloAck;
+	bfcp->arg->primitives = bfcp_new_supported_list(e_primitive_FloorRequest,
+		e_primitive_FloorRelease,
+		e_primitive_FloorRequestQuery,
+		e_primitive_FloorRequestStatus,
+		e_primitive_FloorQuery,
+		e_primitive_FloorStatus,
+		e_primitive_Hello,
+		e_primitive_HelloAck,
+		e_primitive_Goodbye,
+		e_primitive_GoodbyeAck,
+		e_primitive_FloorRequestStatusAck,
+		e_primitive_Error, 0);
+	bfcp->arg->attributes = bfcp_new_supported_list(BENEFICIARY_ID,
+		FLOOR_ID,
+		PRIORITY,
+		ERROR_CODE,
+		PARTICIPANT_PROVIDED_INFO,
+		SUPPORTED_ATTRIBUTES,
+		USER_DISPLAY_NAME,
+		BENEFICIARY_INFORMATION,
+		REQUESTED_BY_INFORMATION,
+		OVERALL_REQUEST_STATUS,
+		DIGEST, 0);
+
+	bfcp->arg->entity->transactionID = recv_msg->entity->transactionID;
+
+	bfcp_message *msg = bfcp_build_message(bfcp->arg);
+	janus_sip_bfcp_send_message(session, msg);
+
+    bfcp_free_message(msg);
+	bfcp_free_supported_list(bfcp->arg->primitives);
+	bfcp->arg->primitives = NULL;
+	bfcp_free_supported_list(bfcp->arg->attributes);
+	bfcp->arg->attributes = NULL;
+	
+	janus_mutex_unlock(&bfcp->mutex);
+}
+
+static void janus_sip_bfcp_send_floor_request(janus_sip_session *session) {
+	janus_sip_bfcp *bfcp = &session->media.bfcp;
+	if(bfcp->arg == NULL) return;
+
+	janus_mutex_lock(&bfcp->mutex);
+	bfcp->arg->primitive = e_primitive_FloorRequest;
+	bfcp->arg->entity->transactionID = bfcp->trans_id++;
+	bfcp->arg->entity->conferenceID = bfcp->conf_id;
+	bfcp->arg->entity->userID = bfcp->user_id;
+	bfcp->arg->fID = bfcp_new_floor_id_list(bfcp->floor_id, 0);
+	bfcp->arg->priority = BFCP_UNUSED_PRIORITY;
+
+	bfcp_message *msg = bfcp_build_message(bfcp->arg);
+	janus_sip_bfcp_send_message(session, msg);
+
+    bfcp_free_message(msg);
+	bfcp_free_floor_id_list(bfcp->arg->fID);
+	bfcp->arg->fID = NULL;
+	janus_mutex_unlock(&bfcp->mutex);
+}
+
+static void janus_sip_bfcp_send_floor_release(janus_sip_session *session) {
+	janus_sip_bfcp *bfcp = &session->media.bfcp;
+	if(bfcp->arg == NULL) return;
+
+	janus_mutex_lock(&bfcp->mutex);
+	bfcp->arg->primitive = e_primitive_FloorRelease;
+	bfcp->arg->entity->transactionID = bfcp->trans_id++;
+	bfcp->arg->fID = bfcp_new_floor_id_list(bfcp->floor_id, 0);
+
+	bfcp_message *msg = bfcp_build_message(bfcp->arg);
+	janus_sip_bfcp_send_message(session, msg);
+
+    bfcp_free_message(msg);
+	bfcp_free_floor_id_list(bfcp->arg->fID);
+	bfcp->arg->fID = NULL;
+	janus_mutex_unlock(&bfcp->mutex);
+}
+
+static void janus_sip_bfcp_send_floor_request_status(janus_sip_session* session, bfcp_received_message* recv_msg) {
+	janus_sip_bfcp *bfcp = &session->media.bfcp;
+	if(bfcp->arg == NULL) return;
+
+	janus_mutex_lock(&bfcp->mutex);
+	bfcp_overall_request_status* oRS = NULL;
+	bfcp_floor_request_status* fRS = NULL;
+	bfcp->arg->primitive = e_primitive_FloorRequestStatus;
+	bfcp->arg->entity->transactionID = recv_msg->entity->transactionID;
+	bfcp->arg->frqID++;
+	
+	oRS = bfcp_new_overall_request_status(bfcp->arg->frqID, recv_msg->primitive == e_primitive_FloorRequest ? BFCP_GRANTED : BFCP_RELEASED, 0, NULL, NULL);
+	fRS = bfcp_new_floor_request_status(bfcp->floor_id, NULL, NULL);
+
+	bfcp->arg->frqInfo = bfcp_new_floor_request_information(bfcp->arg->frqID, oRS, fRS, NULL, NULL, BFCP_UNUSED_PRIORITY, NULL);
+
+	bfcp_message *msg = bfcp_build_message(bfcp->arg);
+	janus_sip_bfcp_send_message(session, msg);
+
+    bfcp_free_message(msg);
+	bfcp_free_floor_request_information_list(bfcp->arg->frqInfo);
+	bfcp->arg->frqInfo = NULL;
+	janus_mutex_unlock(&bfcp->mutex);
+}
+
+static void janus_sip_bfcp_send_floor_status_ack(janus_sip_session* session, bfcp_received_message* recv_msg) {
+	janus_sip_bfcp *bfcp = &session->media.bfcp;
+	if(bfcp->arg == NULL) return;
+
+	janus_mutex_lock(&bfcp->mutex);
+	bfcp->arg->primitive = e_primitive_FloorStatusAck;
+	bfcp->arg->entity->transactionID = recv_msg->entity->transactionID;
+	bfcp->arg->entity->conferenceID = recv_msg->entity->conferenceID;
+	bfcp->arg->entity->userID = recv_msg->entity->userID;
+	if (recv_msg->first_attribute->type == FLOOR_ID)
+	{
+		bfcp->floor_id = recv_msg->arguments->fID->ID;
+		bfcp->arg->fID = bfcp_new_floor_id_list(bfcp->floor_id, 0);
+	}
+
+	bfcp_message *msg = bfcp_build_message(bfcp->arg);
+	janus_sip_bfcp_send_message(session, msg);
+
+    bfcp_free_message(msg);
+	if (bfcp->arg->fID)
+	{
+		bfcp_free_floor_id_list(bfcp->arg->fID);
+		bfcp->arg->fID = NULL;
+	}
+	janus_mutex_unlock(&bfcp->mutex);
+}
+
+static void janus_sip_bfcp_send_floor_request_status_ack(janus_sip_session* session, bfcp_received_message* recv_msg) {
+	janus_sip_bfcp *bfcp = &session->media.bfcp;
+	if(bfcp->arg == NULL) return;
+
+	janus_mutex_lock(&bfcp->mutex);
+	bfcp->arg->primitive = e_primitive_FloorRequestStatusAck;
+	bfcp->arg->entity->transactionID = recv_msg->entity->transactionID;
+	bfcp->arg->fID = bfcp_new_floor_id_list(bfcp->floor_id, 0);
+
+	bfcp_message *msg = bfcp_build_message(bfcp->arg);
+	janus_sip_bfcp_send_message(session, msg);
+
+    bfcp_free_message(msg);
+	bfcp_free_floor_id_list(bfcp->arg->fID);
+	bfcp->arg->fID = NULL;
+	janus_mutex_unlock(&bfcp->mutex);
+}
+
+static void janus_sip_report_bfcp_status(janus_sip_session* session, const char* status) {
+	JANUS_LOG(LOG_INFO, "[%s] BFCP STATUS REPORT, AUX STREAM STATUS (%s)\n", session->account.username, status);
+	
+	json_t* info = json_object();
+	json_object_set_new(info, "sip", json_string("event"));
+	json_t *result = json_object();
+	json_object_set_new(result, "event", json_string("bfcp_status"));
+	json_object_set_new(result, "status", json_string(status));
+	json_object_set_new(info, "result", result);
+	int ret = gateway->push_event(session->handle, &janus_sip_plugin, session->transaction, info, NULL);
+	JANUS_LOG(LOG_VERB, "  >> Pushing event to peer: %d (%s)\n", ret, janus_get_api_error(ret));
+	json_decref(info);
 }
 
 /* Helper method to send an RTCP PLI to the SIP peer */

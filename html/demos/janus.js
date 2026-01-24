@@ -345,6 +345,8 @@ var Janus = (function (factory) {
 		} else if(track.type === 'screen') {
 			// Use the provided capture object as video constraint
 			constraints.video = track.capture;
+		} else if(track.type === 'extvideo') {
+			constraints.video = track.capture;
 		}
 		return constraints;
 	};
@@ -2508,6 +2510,10 @@ var Janus = (function (factory) {
 								groups[track.gumGroup].stream = stream;
 								delete track.gumGroup;
 							}
+						} else if(track.type == 'extvideo') {
+							stream = await navigator.mediaDevices.getUserMedia(constraints);
+							stream.getVideoTracks()[0].enabled = false;
+							stream.getVideoTracks()[0].is_extvideo = true;
 						} else {
 							// Use getDisplayMedia
 							stream = await navigator.mediaDevices.getDisplayMedia(constraints);

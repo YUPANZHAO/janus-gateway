@@ -157,10 +157,11 @@ function itcCustomizeSdp(offer) {
 		if(m_type == "video") {
 			if(m_video_idx == 0) {
 				m_desc += "a=content:main\n";
-				m_video_idx = 1;
 			}else {
 				m_desc += "a=content:slides\n";
 			}
+			m_video_idx++;
+			m_desc += `a=label:${m_video_idx}\n`; 
 		}
 
         m_desc += m_desc_after;
@@ -480,12 +481,16 @@ $(document).ready(function() {
 											toastr.info("Early media...");
 										} else if(event === 'accepted') {
 											Janus.log(result["username"] + " accepted the call!", jsep);
+											console.log("answer sdp:\n", jsep.sdp)
 											// Call can start, now: handle the remote answer
 											if(jsep) {
 												sipcall.handleRemoteJsep({ jsep: jsep, error: doHangup });
 											}
 											toastr.success("Call accepted!");
 											sipcall.callId = callId;
+											sipcall.send({message: {request: "send_bfcp", primitive: "Hello"}});
+											sipcall.send({message: {request: "send_bfcp", primitive: "Hello"}});
+											sipcall.send({message: {request: "send_bfcp", primitive: "Hello"}});
 										} else if(event === 'updatingcall') {
 											// We got a re-INVITE: while we may prompt the user (e.g.,
 											// to notify about media changes), to keep things simple
@@ -536,6 +541,29 @@ $(document).ready(function() {
 												content = content.replace(new RegExp('<', 'g'), '&lt');
 												content = content.replace(new RegExp('>', 'g'), '&gt');
 												toastr.info(content, "Info from " + sender);
+											}
+										} else if(event === 'bfcp_status') {
+											// We got an INFO
+											let status = result["status"];
+											console.log(`zyp debug: BFCP STATUS: (${status})`);
+											if(status === "SERVER OPEN" && sipcall.aux_stream) {
+												sipcall.aux_stream.getTracks().forEach(function(track) {
+													if (track.readyState !== "ended") {
+														track.stop();
+													}
+												});
+												sipcall.aux_stream = null;
+
+												navigator.mediaDevices.getUserMedia({video: true}).then((stream) => {
+													stream.getVideoTracks()[0].enabled = false;
+													stream.getVideoTracks()[0].is_extvideo = true;
+													var sender = sipcall.webrtcStuff.pc.getSenders().find(function(s) {
+														return s.track && s.track.is_extvideo === true;
+													});;
+													sender.replaceTrack(stream.getVideoTracks()[0]);
+												});
+
+												sipcall.request_slides = true;
 											}
 										} else if(event === 'notify') {
 											// We got a NOTIFY
@@ -727,6 +755,7 @@ $(document).ready(function() {
 												'<button id="msg" title="Send message" class="btn btn-info"><i class="fa-solid fa-envelope"></i></button>' +
 												'<button id="info" title="Send INFO" class="btn btn-info"><i class="fa-solid fa-info"></i></button>' +
 												'<button id="transfer" title="Transfer call" class="btn btn-info"><i class="fa-solid fa-share"></i></button>' +
+												'<button id="bfcp" title="Aux Stream" class="btn btn-info"><i class="fa-solid fa-share"></i></button>' +
 											'</span>');
 										for(let i=0; i<12; i++) {
 											if(i<10)
@@ -829,6 +858,55 @@ $(document).ready(function() {
 													}
 												}
 											});
+										});
+										sipcall.request_slides = true;
+										$('#bfcp').click(function() {
+											var release_handle = () => {
+												sipcall.send({message: {request: "send_bfcp", primitive: "FloorRelease" }});
+												
+												sipcall.aux_stream.getTracks().forEach(function(track) {
+													if (track.readyState !== "ended") {
+														track.stop();
+													}
+												});
+												sipcall.aux_stream = null;
+
+												navigator.mediaDevices.getUserMedia({video: true}).then((stream) => {
+													stream.getVideoTracks()[0].enabled = false;
+													stream.getVideoTracks()[0].is_extvideo = true;
+													var sender = sipcall.webrtcStuff.pc.getSenders().find(function(s) {
+														return s.track && s.track.is_extvideo === true;
+													});;
+													sender.replaceTrack(stream.getVideoTracks()[0]);
+												});
+
+												sipcall.request_slides = true;
+											}
+
+											if(sipcall.request_slides) {
+												navigator.mediaDevices.getDisplayMedia({ video: true, audio: false })
+												.then(function(screen_stream) {
+													sipcall.aux_stream = screen_stream;
+
+													var screen_track = screen_stream.getVideoTracks()[0];
+													screen_track.is_extvideo = true;
+													var sender = sipcall.webrtcStuff.pc.getSenders().find(function(s) {
+														return s.track && s.track.is_extvideo === true;
+													});
+													
+													sender.replaceTrack(screen_track);
+													
+													screen_track.onended = function() {
+														release_handle();
+													};
+
+													sipcall.send({message: {request: "send_bfcp", primitive: "FloorRequest" }});
+													sipcall.request_slides = false;
+												});
+											}else {
+												release_handle();
+											}
+
 										});
 									}
 									if(track.kind === "audio") {
